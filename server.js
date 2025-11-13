@@ -1,4 +1,6 @@
-// server.js
+// --------------------------------------------------
+// server.js  — AVA Podio Push Listener
+// --------------------------------------------------
 require("dotenv").config();
 const express = require("express");
 const crypto = require("crypto");
@@ -21,7 +23,6 @@ const {
   LOG_LEVEL
 } = process.env;
 
-// Required for DO:
 const PORT = process.env.PORT || 8080;
 
 // --------------------------------------------------
@@ -33,7 +34,7 @@ function log(...args) {
 }
 
 // --------------------------------------------------
-// STEP 1: Helper – Validate Podio Push Signatures
+// STEP 1: Validate Podio Push Signature
 // --------------------------------------------------
 function validatePodioSignature(body, signature) {
   const computed = crypto
@@ -45,74 +46,79 @@ function validatePodioSignature(body, signature) {
 }
 
 // --------------------------------------------------
-// STEP 2: Forward Payload to AVA Topic
+// STEP 2: Send Payload to AVA Topic
 // --------------------------------------------------
 async function forwardToAVA(payload) {
   try {
     await axios.post(AVA_TOPIC_URL, payload, {
       headers: { "Content-Type": "application/json" }
     });
-    log("✓ Forwarded to AVA");
+    log("✓ Forwarded to AVA topic.");
   } catch (err) {
     console.error("❌ Error forwarding to AVA:", err.response?.data || err.message);
   }
 }
 
-// Optional debug webhook mirroring
+// Optional debug mirroring
 async function forwardToDebug(payload) {
   if (!DEBUG_WEBHOOK_URL) return;
   try {
     await axios.post(DEBUG_WEBHOOK_URL, payload, {
       headers: { "Content-Type": "application/json" }
     });
-    log("✓ Mirrored to debug webhook");
+    log("✓ Mirrored to debug webhook.");
   } catch (err) {
     console.error("❌ Debug webhook error:", err.response?.data || err.message);
   }
 }
 
 // --------------------------------------------------
-// STEP 3: Podio Push Webhook Endpoint
+// STEP 3: Podio Push Event Endpoint
 // --------------------------------------------------
-// Podio will POST handshake + verification + actual push events here.
+// Podio POSTs handshake + verification + push events here.
 app.post("/podio/push", async (req, res) => {
   const body = req.body;
 
-  // Podio Handshake challenge
+  // -----------------------
+  // A. HANDSHAKE CHALLENGE
+  // -----------------------
   if (body.type === "subscription_verification") {
     log("Handshake challenge received.");
 
-    // Return the challenge to confirm subscription
+    // Podio expects the challenge echoed back
     return res.json({
       status: "ok",
-      "subscribe_url": `${APP_BASE_URL}/podio/push`,
-      "challenge": body["challenge"]
+      subscribe_url: `${APP_BASE_URL}/podio/push`,
+      challenge: body["challenge"]
     });
   }
 
-  // Validate signature header
+  // -----------------------
+  // B. VALIDATE SIGNATURE
+  // -----------------------
   const signature = req.headers["x-podio-signature"];
-
   if (!signature || !validatePodioSignature(body, signature)) {
-    console.error("❌ Invalid Podio signature");
+    console.error("❌ Invalid Podio signature.");
     return res.status(401).send("Invalid signature");
   }
 
-  log("✓ Valid Podio push event received.");
+  log("✓ Valid Podio event received.");
   log(JSON.stringify(body, null, 2));
 
-  // Forward event to AVA
+  // -----------------------
+  // C. FORWARD TO AVA
+  // -----------------------
   forwardToAVA(body);
 
-  // Optional debug mirroring
+  // D. Optional debug
   forwardToDebug(body);
 
   return res.status(200).send("OK");
 });
 
 // --------------------------------------------------
-// STEP 4: Server Listening
+// STEP 4: Start Server
 // --------------------------------------------------
-app.listen(PORT, () =>
-  log(`Server running on port ${PORT} (ENV: ${NODE_ENV})`)
-);
+app.listen(PORT, () => {
+  log(`Server running on port ${PORT} (ENV: ${NODE_ENV})`);
+});
