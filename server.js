@@ -1,154 +1,227 @@
-// --------------------------------------------------
-// server.js  — AVA Podio Push Listener
-// --------------------------------------------------
+// server.js
 require("dotenv").config();
 const express = require("express");
-const crypto = require("crypto");
 const axios = require("axios");
+const Faye = require("faye");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// --------------------------------------------------
-// Environment Variables
-// --------------------------------------------------
+// ------------------------------------------------------------------
+// Environment
+// ------------------------------------------------------------------
 const {
-  PODIO_CLIENT_ID,
-  PODIO_CLIENT_SECRET,
-  PODIO_PUSH_SECRET,
-  APP_BASE_URL,
+  PODIO_CLIENT_ID,             // (not used by push, but kept for future OAuth needs)
+  PODIO_CLIENT_SECRET,         // (not used by push, but kept for future OAuth needs)
+  PODIO_COMETD_URL = "https://podio.com:443/cometd", // Set to the correct Podio CometD endpoint per docs
   AVA_TOPIC_URL,
   DEBUG_WEBHOOK_URL,
-  NODE_ENV,
-  LOG_LEVEL
+  NODE_ENV = "production",
+  LOG_LEVEL = "info"
 } = process.env;
 
 const PORT = process.env.PORT || 8080;
 
-// --------------------------------------------------
-// Logging Utility
-// --------------------------------------------------
+// ------------------------------------------------------------------
+// Simple logger
+// ------------------------------------------------------------------
 function log(...args) {
   if (LOG_LEVEL !== "info") return;
-  console.log("[AVA-PODIO]", ...args);
+  console.log("[AVA-PODIO-PUSH]", ...args);
 }
 
-// --------------------------------------------------
-// STEP 1: Validate Podio Push Signature
-// --------------------------------------------------
-function validatePodioSignature(body, signature) {
-  const computed = crypto
-    .createHmac("sha1", PODIO_PUSH_SECRET)
-    .update(JSON.stringify(body))
-    .digest("hex");
+// ------------------------------------------------------------------
+// Active subscriptions store (in-memory)
+//   key: channel string (e.g., "/task/307507945")
+//   value: { client, subscription }
+// ------------------------------------------------------------------
+const active = new Map();
 
-  return computed === signature;
-}
-
-// --------------------------------------------------
-// STEP 2: Send Payload to AVA Topic
-// --------------------------------------------------
+// ------------------------------------------------------------------
+// Helpers: forward payloads
+// ------------------------------------------------------------------
 async function forwardToAVA(payload) {
+  if (!AVA_TOPIC_URL) return;
   try {
-    await axios.post(AVA_TOPIC_URL, payload, {
-      headers: { "Content-Type": "application/json" }
-    });
-    log("✓ Forwarded to AVA topic.");
+    await axios.post(AVA_TOPIC_URL, payload, { headers: { "Content-Type": "application/json" } });
+    log("→ Forwarded to AVA_TOPIC_URL");
   } catch (err) {
-    console.error("❌ Error forwarding to AVA:", err.response?.data || err.message);
+    console.error("Forward AVA error:", err.response?.status, err.response?.data || err.message);
   }
 }
 
-// Optional debug mirroring
 async function forwardToDebug(payload) {
   if (!DEBUG_WEBHOOK_URL) return;
   try {
-    await axios.post(DEBUG_WEBHOOK_URL, payload, {
-      headers: { "Content-Type": "application/json" }
-    });
-    log("✓ Mirrored to debug webhook.");
+    await axios.post(DEBUG_WEBHOOK_URL, payload, { headers: { "Content-Type": "application/json" } });
+    log("→ Mirrored to DEBUG_WEBHOOK_URL");
   } catch (err) {
-    console.error("❌ Debug webhook error:", err.response?.data || err.message);
+    console.error("Forward DEBUG error:", err.response?.status, err.response?.data || err.message);
   }
 }
 
-// --------------------------------------------------
-// STEP 3: Podio Push Event Endpoint
-// --------------------------------------------------
-// Podio POSTs handshake + verification + push events here.
-app.post("/podio/push", async (req, res) => {
-  const body = req.body;
+// ------------------------------------------------------------------
+// Subscribe logic
+// ------------------------------------------------------------------
+async function subscribeToChannel({ channel, signature, timestamp }) {
+  // If already subscribed, return current status
+  if (active.has(channel)) {
+    return { status: "already_subscribed", channel };
+  }
 
-  // -----------------------
-  // A. HANDSHAKE CHALLENGE
-  // -----------------------
-  if (body.type === "subscription_verification") {
-    log("Handshake challenge received.");
+  // Create a dedicated CometD/Faye client for this channel
+  const client = new Faye.Client(PODIO_COMETD_URL, {
+    timeout: 60,           // seconds
+    retry: 5,              // seconds before retry
+  });
 
-    // Podio expects the challenge echoed back
-    return res.json({
-      status: "ok",
-      subscribe_url: `${APP_BASE_URL}/podio/push`,
-      challenge: body["challenge"]
+  // Inject the private_pub auth ONLY on subscribe for this channel
+  client.addExtension({
+    outgoing: function (message, callback) {
+      if (message.channel === "/meta/subscribe" && message.subscription === channel) {
+        message.ext = message.ext || {};
+        message.ext.private_pub_signature = String(signature);
+        message.ext.private_pub_timestamp = String(timestamp);
+      }
+      callback(message);
+    }
+  });
+
+  // Subscribe and forward all push messages to AVA + DEBUG
+  const subscription = client.subscribe(channel, async (pushPayload) => {
+    // pushPayload has the Podio push structure: { ref, event, created_by, ... }
+    log(`Received push on ${channel}:`, JSON.stringify(pushPayload));
+    const envelope = {
+      meta: {
+        channel,
+        received_at: new Date().toISOString(),
+        source: "podio-push"
+      },
+      push_event: pushPayload
+    };
+    await forwardToAVA(envelope);
+    await forwardToDebug(envelope);
+  });
+
+  // Attach basic error logging
+  subscription.errback((err) => {
+    console.error(`Subscription error on ${channel}:`, err?.message || err);
+  });
+
+  // Confirm handshake by waiting for initial subscribe success
+  await new Promise((resolve, reject) => {
+    let done = false;
+    subscription.callback(() => {
+      if (done) return;
+      done = true;
+      resolve();
     });
+    setTimeout(() => {
+      if (done) return;
+      reject(new Error("Subscribe timeout (no confirmation received)"));
+    }, 15000);
+  });
+
+  active.set(channel, { client, subscription });
+  log(`✓ Subscribed to ${channel}`);
+  return { status: "subscribed", channel };
+}
+
+// ------------------------------------------------------------------
+// Unsubscribe logic
+// ------------------------------------------------------------------
+async function unsubscribeFromChannel(channel) {
+  const rec = active.get(channel);
+  if (!rec) return { status: "not_found", channel };
+
+  try {
+    await rec.subscription.cancel();
+  } catch (e) {
+    // ignore cancel errors
   }
-
-  // -----------------------
-  // B. VALIDATE SIGNATURE
-  // -----------------------
-  const signature = req.headers["x-podio-signature"];
-  if (!signature || !validatePodioSignature(body, signature)) {
-    console.error("❌ Invalid Podio signature.");
-    return res.status(401).send("Invalid signature");
+  try {
+    rec.client.disconnect();
+  } catch (e) {
+    // ignore disconnect errors
   }
+  active.delete(channel);
+  log(`✗ Unsubscribed from ${channel}`);
+  return { status: "unsubscribed", channel };
+}
 
-  log("✓ Valid Podio event received.");
-  log(JSON.stringify(body, null, 2));
+// ------------------------------------------------------------------
+// Routes
+// ------------------------------------------------------------------
 
-  // -----------------------
-  // C. FORWARD TO AVA
-  // -----------------------
-  forwardToAVA(body);
-
-  // D. Optional debug
-  forwardToDebug(body);
-
-  return res.status(200).send("OK");
-});
-
-// --------------------------------------------------
-// STEP 4: Start Server
-// --------------------------------------------------
-app.listen(PORT, () => {
-  log(`Server running on port ${PORT} (ENV: ${NODE_ENV})`);
-});
-
-// --------------------------------------------------
-// OPTIONAL: /subscribe endpoint to accept a Podio push "push" blob
-// --------------------------------------------------
+/**
+ * POST /subscribe
+ * Body:
+ * {
+ *   "push": {
+ *     "channel": "/task/307507945",
+ *     "timestamp": 1763059054,
+ *     "signature": "040c1759...",
+ *     "expires_in": 21600
+ *   }
+ * }
+ */
 app.post("/subscribe", async (req, res) => {
   try {
-    const { push } = req.body || {};
-    if (!push || !push.channel || !push.timestamp || !push.signature) {
-      return res.status(400).json({ error: "Invalid payload: missing push.channel/timestamp/signature" });
+    const push = req.body?.push || {};
+    const { channel, signature, timestamp } = push;
+
+    if (!channel || !signature || !timestamp) {
+      return res.status(400).json({
+        error: "Missing required fields: push.channel, push.signature, push.timestamp"
+      });
     }
 
-    // Example: store intent or enqueue a background job
-    // await saveSubscriptionIntent(push) // your persistence
-
-    // If you are using a CometD client, you would subscribe like:
-    // cometd.handshake(() => {
-    //   cometd.subscribe(push.channel, onMessage, {
-    //     ext: {
-    //       private_pub_signature: push.signature,
-    //       private_pub_timestamp: String(push.timestamp)
-    //     }
-    //   });
-    // });
-
-    return res.status(200).json({ status: "ok", subscribed: push.channel, expires_in: push.expires_in });
+    const result = await subscribeToChannel({ channel, signature, timestamp });
+    return res.json({
+      ok: true,
+      result,
+      cometd: PODIO_COMETD_URL
+    });
   } catch (err) {
-    console.error("Subscribe error:", err);
-    return res.status(500).json({ error: "Internal error" });
+    console.error("Subscribe error:", err.message || err);
+    return res.status(500).json({ ok: false, error: err.message || "Internal error" });
   }
+});
+
+/**
+ * POST /unsubscribe
+ * Body:
+ * { "channel": "/task/307507945" }
+ */
+app.post("/unsubscribe", async (req, res) => {
+  try {
+    const { channel } = req.body || {};
+    if (!channel) return res.status(400).json({ error: "Missing body.channel" });
+
+    const result = await unsubscribeFromChannel(channel);
+    return res.json({ ok: true, result });
+  } catch (err) {
+    console.error("Unsubscribe error:", err.message || err);
+    return res.status(500).json({ ok: false, error: err.message || "Internal error" });
+  }
+});
+
+/**
+ * GET /health
+ */
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    env: NODE_ENV,
+    cometd: PODIO_COMETD_URL,
+    subscriptions: Array.from(active.keys())
+  });
+});
+
+// ------------------------------------------------------------------
+// Start server
+// ------------------------------------------------------------------
+app.listen(PORT, () => {
+  log(`Server listening on :${PORT} (env: ${NODE_ENV})`);
+  log(`CometD endpoint: ${PODIO_COMETD_URL}`);
 });
