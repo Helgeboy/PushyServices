@@ -122,3 +122,33 @@ app.post("/podio/push", async (req, res) => {
 app.listen(PORT, () => {
   log(`Server running on port ${PORT} (ENV: ${NODE_ENV})`);
 });
+
+// --------------------------------------------------
+// OPTIONAL: /subscribe endpoint to accept a Podio push "push" blob
+// --------------------------------------------------
+app.post("/subscribe", async (req, res) => {
+  try {
+    const { push } = req.body || {};
+    if (!push || !push.channel || !push.timestamp || !push.signature) {
+      return res.status(400).json({ error: "Invalid payload: missing push.channel/timestamp/signature" });
+    }
+
+    // Example: store intent or enqueue a background job
+    // await saveSubscriptionIntent(push) // your persistence
+
+    // If you are using a CometD client, you would subscribe like:
+    // cometd.handshake(() => {
+    //   cometd.subscribe(push.channel, onMessage, {
+    //     ext: {
+    //       private_pub_signature: push.signature,
+    //       private_pub_timestamp: String(push.timestamp)
+    //     }
+    //   });
+    // });
+
+    return res.status(200).json({ status: "ok", subscribed: push.channel, expires_in: push.expires_in });
+  } catch (err) {
+    console.error("Subscribe error:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
