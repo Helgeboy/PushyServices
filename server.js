@@ -218,6 +218,13 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.post("/podio/push", (req, res) => {
+  log("Podio push event received:", JSON.stringify(req.body, null, 2));
+  // Optionally, you can forward the payload somewhere else, or just acknowledge.
+  res.status(200).send("OK");
+});
+
+
 // ------------------------------------------------------------------
 // Start server
 // ------------------------------------------------------------------
