@@ -11,7 +11,7 @@
     "constantinople": "^4.0.1",
     "cookie-parser": "^1.4.7",
     "debug": "^4.4.1",
-    "dotenv": "^16.0.3",
+    "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "faye": "^1.4.0",
     "http-errors": "^2.0.0",
